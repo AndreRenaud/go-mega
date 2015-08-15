@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/big"
 	mrand "math/rand"
@@ -604,8 +605,28 @@ func (m *Mega) getFileSystem() error {
 	return nil
 }
 
-// Download file from filesystem
+// Download file from filesystem to a local file
 func (m Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error {
+	_, err := os.Stat(dstpath)
+	if os.IsExist(err) {
+		os.Remove(dstpath)
+	}
+
+	outfile, err := os.OpenFile(dstpath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return err
+	}
+	outfile.Close()
+
+	if _, err := m.Download(src, outfile, progress); err != nil {
+		os.Remove(dstpath)
+		return err
+	}
+
+	return nil
+}
+
+func (m Mega) Download(src *Node, outfile io.WriterAt, progress *chan int) (int64, error) {
 	m.FS.mutex.Lock()
 	defer m.FS.mutex.Unlock()
 
@@ -616,23 +637,12 @@ func (m Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error 
 	}()
 
 	if src == nil {
-		return EARGS
+		return 0, EARGS
 	}
 
 	var msg [1]DownloadMsg
 	var res [1]DownloadResp
-	var outfile *os.File
 	var mutex sync.Mutex
-
-	_, err := os.Stat(dstpath)
-	if os.IsExist(err) {
-		os.Remove(dstpath)
-	}
-
-	outfile, err = os.OpenFile(dstpath, os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		return err
-	}
 
 	msg[0].Cmd = "g"
 	msg[0].G = 1
@@ -641,12 +651,12 @@ func (m Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error 
 	request, _ := json.Marshal(msg)
 	result, err := m.api_request(request)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	err = json.Unmarshal(result, &res)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	resourceUrl := res[0].G
 
@@ -660,7 +670,8 @@ func (m Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error 
 	iv := a32_to_bytes([]uint32{t[0], t[1], t[0], t[1]})
 
 	sorted_chunks := []int{}
-	chunks := getChunkSizes(int(res[0].Size))
+	filesize := int64(res[0].Size)
+	chunks := getChunkSizes(int(filesize))
 	chunk_macs := make([][]byte, len(chunks))
 
 	for k, _ := range chunks {
@@ -755,22 +766,16 @@ func (m Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error 
 
 	wg.Wait()
 
-	if err != nil {
-		os.Remove(dstpath)
-		return err
-	}
-
 	for _, v := range chunk_macs {
 		mac_enc.CryptBlocks(mac_data, v)
 	}
 
-	outfile.Close()
 	tmac := bytes_to_a32(mac_data)
 	if bytes.Equal(a32_to_bytes([]uint32{tmac[0] ^ tmac[1], tmac[2] ^ tmac[3]}), src.meta.mac) == false {
-		return EMACMISMATCH
+		return 0, EMACMISMATCH
 	}
 
-	return nil
+	return filesize, nil
 }
 
 // Upload a file to the filesystem
